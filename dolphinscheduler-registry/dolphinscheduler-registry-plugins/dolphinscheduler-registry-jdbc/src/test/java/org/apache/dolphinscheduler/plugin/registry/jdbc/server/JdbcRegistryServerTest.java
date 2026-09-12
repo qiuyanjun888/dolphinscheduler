@@ -32,6 +32,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.junit.jupiter.api.AfterEach;
@@ -95,6 +96,38 @@ class JdbcRegistryServerTest {
     @AfterEach
     void tearDown() {
         jdbcRegistryServer.close();
+    }
+
+    @Test
+    void close_shouldOnlyPurgeClientsOnceWhenCalledConcurrently() throws Exception {
+        CountDownLatch firstPurgeStarted = new CountDownLatch(1);
+        CountDownLatch allowFirstPurgeToFinish = new CountDownLatch(1);
+        AtomicInteger purgeInvocations = new AtomicInteger();
+        Mockito.doAnswer(invocation -> {
+            if (purgeInvocations.incrementAndGet() == 1) {
+                firstPurgeStarted.countDown();
+                allowFirstPurgeToFinish.await(5, TimeUnit.SECONDS);
+            }
+            return null;
+        }).when(jdbcRegistryClientRepository).deleteByIds(Mockito.any());
+        ExecutorService closeExecutor = Executors.newFixedThreadPool(2);
+        Future<?> firstClose = closeExecutor.submit(jdbcRegistryServer::close);
+        Future<?> secondClose = null;
+
+        try {
+            Truth.assertThat(firstPurgeStarted.await(5, TimeUnit.SECONDS)).isTrue();
+            secondClose = closeExecutor.submit(jdbcRegistryServer::close);
+            secondClose.get(5, TimeUnit.SECONDS);
+
+            Truth.assertThat(purgeInvocations.get()).isEqualTo(1);
+        } finally {
+            allowFirstPurgeToFinish.countDown();
+            firstClose.get(5, TimeUnit.SECONDS);
+            if (secondClose != null) {
+                secondClose.get(5, TimeUnit.SECONDS);
+            }
+            closeExecutor.shutdownNow();
+        }
     }
 
     @Test

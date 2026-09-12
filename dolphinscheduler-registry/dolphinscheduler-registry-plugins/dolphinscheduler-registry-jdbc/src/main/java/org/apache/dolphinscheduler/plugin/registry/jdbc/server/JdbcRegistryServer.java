@@ -45,6 +45,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.stream.Collectors;
 
 import lombok.SneakyThrows;
@@ -60,6 +61,10 @@ import com.google.common.collect.Lists;
 @Slf4j
 public class JdbcRegistryServer implements IJdbcRegistryServer {
 
+    private static final AtomicReferenceFieldUpdater<JdbcRegistryServer, JdbcRegistryServerState> SERVER_STATE_UPDATER =
+            AtomicReferenceFieldUpdater.newUpdater(
+                    JdbcRegistryServer.class, JdbcRegistryServerState.class, "jdbcRegistryServerState");
+
     private final JdbcRegistryProperties jdbcRegistryProperties;
 
     private final JdbcRegistryLockRepository jdbcRegistryLockRepository;
@@ -70,7 +75,7 @@ public class JdbcRegistryServer implements IJdbcRegistryServer {
 
     private final JdbcRegistryLockManager jdbcRegistryLockManager;
 
-    private JdbcRegistryServerState jdbcRegistryServerState;
+    private volatile JdbcRegistryServerState jdbcRegistryServerState;
 
     private final List<IJdbcRegistryClient> jdbcRegistryClients = new CopyOnWriteArrayList<>();
 
@@ -167,7 +172,7 @@ public class JdbcRegistryServer implements IJdbcRegistryServer {
     }
 
     @Override
-    public synchronized JdbcRegistryServerState getServerState() {
+    public JdbcRegistryServerState getServerState() {
         return jdbcRegistryServerState;
     }
 
@@ -257,7 +262,11 @@ public class JdbcRegistryServer implements IJdbcRegistryServer {
     @Override
     public void close() {
         synchronized (this) {
-            jdbcRegistryServerState = JdbcRegistryServerState.STOPPED;
+            if (SERVER_STATE_UPDATER.getAndSet(this,
+                    JdbcRegistryServerState.STOPPED) == JdbcRegistryServerState.STOPPED) {
+                log.warn("The JdbcRegistryServer is already STOPPED.");
+                return;
+            }
         }
         schedulerThreadExecutor.shutdown();
         List<Long> clientIds = jdbcRegistryClients.stream()
@@ -375,28 +384,31 @@ public class JdbcRegistryServer implements IJdbcRegistryServer {
         }
     }
 
-    private synchronized void transitionToStarted() {
-        if (jdbcRegistryServerState != JdbcRegistryServerState.SUSPENDED) {
-            return;
+    private void transitionToStarted() {
+        if (SERVER_STATE_UPDATER.compareAndSet(
+                this, JdbcRegistryServerState.SUSPENDED, JdbcRegistryServerState.STARTED)) {
+            doTriggerReconnectedListener();
         }
-        jdbcRegistryServerState = JdbcRegistryServerState.STARTED;
-        doTriggerReconnectedListener();
     }
 
-    private synchronized void transitionToSuspended() {
-        if (jdbcRegistryServerState != JdbcRegistryServerState.STARTED) {
-            return;
-        }
-        jdbcRegistryServerState = JdbcRegistryServerState.SUSPENDED;
+    private void transitionToSuspended() {
+        SERVER_STATE_UPDATER.compareAndSet(
+                this, JdbcRegistryServerState.STARTED, JdbcRegistryServerState.SUSPENDED);
     }
 
-    private synchronized void transitionToDisconnected() {
-        if (jdbcRegistryServerState != JdbcRegistryServerState.STARTED
-                && jdbcRegistryServerState != JdbcRegistryServerState.SUSPENDED) {
-            return;
+    private void transitionToDisconnected() {
+        while (true) {
+            JdbcRegistryServerState currentState = jdbcRegistryServerState;
+            if (currentState != JdbcRegistryServerState.STARTED
+                    && currentState != JdbcRegistryServerState.SUSPENDED) {
+                return;
+            }
+            if (SERVER_STATE_UPDATER.compareAndSet(
+                    this, currentState, JdbcRegistryServerState.DISCONNECTED)) {
+                doTriggerOnDisConnectedListener();
+                return;
+            }
         }
-        jdbcRegistryServerState = JdbcRegistryServerState.DISCONNECTED;
-        doTriggerOnDisConnectedListener();
     }
 
     private void doTriggerReconnectedListener() {
